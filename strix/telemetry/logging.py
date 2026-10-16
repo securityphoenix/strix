@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import os
+import sys
 import warnings
 from contextvars import ContextVar
 from pathlib import Path  # noqa: TC003  used at runtime by ``setup_scan_logging``
@@ -58,23 +60,102 @@ _NOISY_LIBS: tuple[str, ...] = (
 
 
 _HANDLER_TAG = "_strix_scan_handler"
+_STREAM_TAG = "_strix_stream_handler"
 
 
 # ``openai.agents`` is the openai-agents SDK's canonical logger root.
 _TRACKED_ROOTS: tuple[str, ...] = ("strix", "openai.agents")
 
+_STDOUT_QUIET_ROOTS: frozenset[str] = frozenset({"openai.agents"})
+
+
+class _StdoutQuietFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        return not any(
+            record.name == root or record.name.startswith(root + ".")
+            for root in _STDOUT_QUIET_ROOTS
+        )
+
+
+class _PtyThresholdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "PTY process count reached warning threshold" not in record.getMessage()
+
+
+@functools.cache  # install once; tests reset via ``cache_clear()``
+def _silence_pty_threshold_warning() -> None:
+    logging.getLogger("agents.sandbox.sandboxes.docker").addFilter(_PtyThresholdFilter())
+
 
 def configure_dependency_logging() -> None:
     """Quiet dependency logging/warnings that obscure Strix scan logs."""
-    with contextlib.suppress(Exception):
-        import litellm
-
-        litellm_logging = litellm._logging
-        litellm_logging._disable_debugging()  # type: ignore[no-untyped-call]
+    litellm = sys.modules.get("litellm")
+    if litellm is not None:
+        with contextlib.suppress(Exception):
+            litellm._logging._disable_debugging()
 
     logging.getLogger("asyncio").setLevel(logging.CRITICAL)
     logging.getLogger("asyncio").propagate = False
     warnings.filterwarnings("ignore", category=RuntimeWarning, module="asyncio")
+    _route_unraisable_to_log()
+    _silence_pty_threshold_warning()
+
+
+def _route_unraisable_to_log() -> None:
+    def hook(u: sys.UnraisableHookArgs) -> None:
+        with contextlib.suppress(BaseException):
+            logger = logging.getLogger("strix.telemetry")
+            if logger.hasHandlers():
+                logger.warning(
+                    u.err_msg or f"Exception ignored in {u.object!r}",
+                    exc_info=(u.exc_type, u.exc_value, u.exc_traceback),  # type: ignore[arg-type]
+                )
+
+    sys.unraisablehook = hook
+
+
+class _CurrentStderrHandler(logging.StreamHandler):  # type: ignore[type-arg]
+    def __init__(self, level: int) -> None:
+        logging.Handler.__init__(self, level)
+
+    @property
+    def stream(self) -> object:
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, _value: object) -> None:
+        pass
+
+
+def _debug_enabled(debug: bool | None) -> bool:
+    if debug is not None:
+        return debug
+    return (os.environ.get("STRIX_DEBUG") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _stream_handler(debug: bool) -> logging.Handler:
+    handler = _CurrentStderrHandler(logging.DEBUG if debug else logging.ERROR)
+    handler.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATEFMT))
+    handler.addFilter(_StrixContextFilter())
+    handler.addFilter(_StdoutQuietFilter())
+    setattr(handler, _STREAM_TAG, True)
+    return handler
+
+
+def _has_stream_handler(tracked: logging.Logger) -> bool:
+    return any(getattr(handler, _STREAM_TAG, False) for handler in tracked.handlers)
+
+
+def setup_console_logging(*, debug: bool | None = None) -> None:
+    configure_dependency_logging()
+    for name in _TRACKED_ROOTS:
+        tracked = logging.getLogger(name)
+        tracked.setLevel(logging.DEBUG)
+        tracked.propagate = False
+        if not _has_stream_handler(tracked):
+            tracked.addHandler(_stream_handler(_debug_enabled(debug)))
 
 
 def setup_scan_logging(run_dir: Path, *, debug: bool | None = None) -> Callable[[], None]:
@@ -95,37 +176,25 @@ def setup_scan_logging(run_dir: Path, *, debug: bool | None = None) -> Callable[
     """
     configure_dependency_logging()
 
-    if debug is None:
-        debug = (os.environ.get("STRIX_DEBUG") or "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+    debug = _debug_enabled(debug)
 
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "strix.log"
 
-    formatter = logging.Formatter(_FORMAT, datefmt=_DATEFMT)
-    context_filter = _StrixContextFilter()
-
     file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-    file_handler.addFilter(context_filter)
+    file_handler.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATEFMT))
+    file_handler.addFilter(_StrixContextFilter())
     setattr(file_handler, _HANDLER_TAG, True)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setLevel(logging.DEBUG if debug else logging.ERROR)
-    stream_handler.setFormatter(formatter)
-    stream_handler.addFilter(context_filter)
-    setattr(stream_handler, _HANDLER_TAG, True)
 
     tracked_loggers = [logging.getLogger(name) for name in _TRACKED_ROOTS]
     for tracked in tracked_loggers:
         tracked.setLevel(logging.DEBUG)
         tracked.addHandler(file_handler)
-        tracked.addHandler(stream_handler)
+        if not _has_stream_handler(tracked):
+            stream_handler = _stream_handler(debug)
+            setattr(stream_handler, _HANDLER_TAG, True)
+            tracked.addHandler(stream_handler)
         tracked.propagate = False
 
     for name in _NOISY_LIBS:

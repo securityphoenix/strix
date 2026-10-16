@@ -1,13 +1,17 @@
-import json
 import logging
-import urllib.request
-from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+import requests
+
 from strix.config import load_settings
+from strix.skills import get_loaded_skill_names
 from strix.telemetry._common import (
+    SEND_TIMEOUT,
     SESSION_ID,
     base_props,
+    exception_props,
+    get_scan_phase,
+    get_version,
     is_first_run,
 )
 
@@ -26,28 +30,30 @@ def _is_enabled() -> bool:
     return load_settings().telemetry.enabled
 
 
-def _send(event: str, properties: dict[str, Any]) -> None:
+def _send(event: str, properties: dict[str, Any]) -> bool:
     if not _is_enabled():
         logger.debug("posthog disabled; skipping event %s", event)
-        return
+        return False
     try:
         payload = {
             "api_key": _POSTHOG_PUBLIC_API_KEY,
             "event": event,
             "distinct_id": SESSION_ID,
-            "properties": properties,
+            "properties": {
+                **properties,
+                "$lib": "strix-cli",
+                "$lib_version": get_version(),
+                "$process_person_profile": False,
+            },
         }
-        req = urllib.request.Request(  # noqa: S310
-            f"{_POSTHOG_HOST}/capture/",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=10):  # noqa: S310  # nosec B310
+        with requests.post(f"{_POSTHOG_HOST}/capture/", json=payload, timeout=SEND_TIMEOUT):
             pass
     except Exception:  # noqa: BLE001
         logger.debug("posthog send failed for event %s", event, exc_info=True)
+        return False
     else:
         logger.debug("posthog event sent: %s", event)
+        return True
 
 
 def start(
@@ -56,12 +62,14 @@ def start(
     is_whitebox: bool,
     interactive: bool,
     has_instructions: bool,
+    auth_mode: str | None = None,
 ) -> None:
     _send(
         "scan_started",
         {
             **base_props(),
             "model": model or "unknown",
+            "auth_mode": auth_mode or "api_key",
             "scan_mode": scan_mode or "unknown",
             "scan_type": "whitebox" if is_whitebox else "blackbox",
             "interactive": interactive,
@@ -71,34 +79,35 @@ def start(
     )
 
 
-def finding(severity: str) -> None:
+def finding(severity: str, cwe: str | None = None, is_cve: bool = False) -> None:
     _send(
         "finding_reported",
         {
             **base_props(),
             "severity": severity.lower(),
+            "cwe": (cwe or "").strip().lower() or "unknown",
+            "is_cve": is_cve,
         },
     )
 
 
 def end(report_state: "ReportState", exit_reason: str = "completed") -> None:
+    if report_state.posthog_scan_ended_sent:
+        return
+    if report_state.scan_ended_exit_reason is None:
+        report_state.scan_ended_exit_reason = exit_reason
+
     vulnerabilities_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
     for v in report_state.vulnerability_reports:
         sev = v.get("severity", "info").lower()
         if sev in vulnerabilities_counts:
             vulnerabilities_counts[sev] += 1
 
-    duration = 0.0
-    try:
-        start = datetime.fromisoformat(report_state.start_time.replace("Z", "+00:00"))
-        end_iso = report_state.end_time or datetime.now(start.tzinfo).isoformat()
-        duration = (datetime.fromisoformat(end_iso.replace("Z", "+00:00")) - start).total_seconds()
-    except (ValueError, TypeError, AttributeError):
-        pass
+    duration = report_state.get_process_duration_seconds()
 
     llm_props: dict[str, int | float] = {}
     try:
-        usage = report_state.get_total_llm_usage()
+        usage = report_state.get_process_llm_usage()
         if isinstance(usage, dict):
             llm_props = {
                 "llm_requests": int(usage.get("requests") or 0),
@@ -109,20 +118,76 @@ def end(report_state: "ReportState", exit_reason: str = "completed") -> None:
             }
     except (TypeError, ValueError, AttributeError):
         pass
+    providers = report_state.get_process_llm_providers()
 
-    _send(
+    report_state.posthog_scan_ended_sent = _send(
         "scan_ended",
         {
             **base_props(),
-            "exit_reason": exit_reason,
+            "auth_mode": report_state.run_record.get("auth_mode") or "api_key",
+            "exit_reason": report_state.scan_ended_exit_reason,
             "duration_seconds": round(duration),
             "vulnerabilities_total": len(report_state.vulnerability_reports),
             **{f"vulnerabilities_{k}": v for k, v in vulnerabilities_counts.items()},
             **llm_props,
+            **({"llm_providers": providers} if providers else {}),
+            "skills": get_loaded_skill_names(),
         },
     )
 
 
-def error(error_type: str) -> None:
-    props = {**base_props(), "error_type": error_type}
+def viewer_opened(source: str, live: bool) -> None:
+    _send(
+        "viewer_opened",
+        {
+            **base_props(),
+            "source": source,
+            "live": live,
+        },
+    )
+
+
+def viewer_cta_clicked(cta: str, surface: str | None = None) -> None:
+    props = {
+        **base_props(),
+        "cta": cta[:64],
+    }
+    if surface:
+        props["surface"] = surface[:64]
+    _send("viewer_cta_clicked", props)
+
+
+_VIEWER_EMAIL_STEPS = frozenset(
+    {"email_submitted", "email_verified", "report_sent", "work_email_required"}
+)
+
+
+def viewer_email_event(step: str, purpose: str | None = None) -> None:
+    if step not in _VIEWER_EMAIL_STEPS:
+        return
+    _send(
+        f"viewer_{step}",
+        {
+            **base_props(),
+            **({"purpose": purpose} if purpose else {}),
+        },
+    )
+
+
+def viewer_feedback_submitted() -> None:
+    _send("viewer_feedback_submitted", {**base_props()})
+
+
+def viewer_agent_steered() -> None:
+    _send("viewer_agent_steered", {**base_props()})
+
+
+def error(error_type: str, exc: BaseException | None = None) -> None:
+    props: dict[str, Any] = {
+        **base_props(),
+        "error_type": error_type,
+        "phase": get_scan_phase(),
+    }
+    if exc is not None:
+        props.update(exception_props(exc))
     _send("error", props)

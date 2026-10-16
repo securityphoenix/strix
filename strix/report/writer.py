@@ -6,17 +6,114 @@ import csv
 import io
 import json
 import logging
+import re
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+from pygments.lexers import PythonLexer, get_lexer_by_name, guess_lexer
+from pygments.lexers.special import TextLexer
+from pygments.util import ClassNotFound
 
 from strix.core.paths import run_record_path
 
 
+if TYPE_CHECKING:
+    from pygments.lexer import Lexer
+
 logger = logging.getLogger(__name__)
 
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+_FENCE_RE = re.compile(r"^```([^\n`]*)\r?\n(.*?)\r?\n?```$", re.DOTALL)
+_BACKTICK_RUN = re.compile(r"`+")
+
+
+def csv_safe(value: object) -> str:
+    """Return ``value`` as a CSV cell a spreadsheet will not treat as a formula.
+
+    Excel, LibreOffice and Sheets evaluate a cell whose first character is one of
+    ``= + - @``, tab or carriage return. The :mod:`csv` module quotes CSV syntax
+    but has no notion of formula triggers, so such a value reaches the cell intact
+    and is executed on open (CWE-1236). Vulnerability titles quote text from the
+    scanned target, which is exactly the attacker-influenced input this guards
+    against.
+
+    Prefixing with an apostrophe is the standard mitigation (OWASP): the rest of
+    the cell is kept as literal text instead of being evaluated. Excel shows the
+    apostrophe when it opens a ``.csv`` directly, which is cosmetic — the point is
+    that nothing runs.
+    """
+    text = str(value)
+    if text.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + text
+    return text
+
+
+def safe_fence(content: str) -> str:
+    """Return a backtick fence that ``content`` cannot break out of.
+
+    Per CommonMark a fenced code block is closed only by a run of backticks at
+    least as long as the opening fence. LLM-authored, attacker-influenced values
+    (PoC scripts, code snippets) may contain their own ``` runs, so we open with
+    a fence one backtick longer than the longest run inside ``content`` (never
+    fewer than three). Everything in ``content`` then renders verbatim.
+    """
+    longest = max((len(m.group()) for m in _BACKTICK_RUN.finditer(content)), default=0)
+    return "`" * max(3, longest + 1)
+
+
+def parse_fenced_code(raw: str) -> tuple[str | None, str]:
+    """Split an optionally fenced code string into ``(language, code)``.
+
+    Agent-generated code fields (e.g. ``poc_script_code``) are stored wrapped in
+    a markdown fence carrying the language, like ``` ```python\n...\n``` ```.
+    Return the fence's language tag and the inner code, or ``(None, raw)`` when
+    the value isn't fenced.
+    """
+    match = _FENCE_RE.match(raw.strip())
+    if not match:
+        return None, raw
+    info = match.group(1).strip()
+    language = info.split()[0] if info else None
+    return (language or None), match.group(2)
+
+
+def resolve_lexer(language: str | None, code: str) -> Lexer:
+    """Pick a pygments lexer for ``code``.
+
+    Prefer the explicit fence ``language`` when it names a known lexer, otherwise
+    auto-detect from the source. Fall back to Python when detection is
+    inconclusive, since legacy (unfenced) PoC scripts are Python.
+    """
+    if language:
+        try:
+            return get_lexer_by_name(language)
+        except ClassNotFound:
+            pass
+    try:
+        lexer = guess_lexer(code)
+    except ClassNotFound:
+        return cast("Lexer", PythonLexer())
+    # ``guess_lexer`` returns the plain-text lexer when it can't detect anything.
+    if isinstance(lexer, TextLexer):
+        return cast("Lexer", PythonLexer())
+    return lexer
+
+
+def guess_language_name(code: str) -> str:
+    """Return a markdown fence tag for ``code``, defaulting to ``python`` when
+    auto-detection is inconclusive."""
+    try:
+        lexer = guess_lexer(code)
+    except ClassNotFound:
+        return "python"
+    if isinstance(lexer, TextLexer) or not lexer.aliases:
+        return "python"
+    return str(lexer.aliases[0])
 
 
 def read_run_record(run_dir: Path) -> dict[str, Any]:
@@ -33,7 +130,7 @@ def read_run_record(run_dir: Path) -> dict[str, Any]:
 
 
 def write_run_record(run_dir: Path, run_record: dict[str, Any]) -> None:
-    _atomic_write_text(
+    atomic_write_text(
         run_record_path(run_dir),
         json.dumps(run_record, ensure_ascii=False, indent=2, default=str),
     )
@@ -59,7 +156,7 @@ def write_vulnerabilities(
     new_reports = [r for r in vulnerability_reports if r["id"] not in saved_vuln_ids]
 
     for report in new_reports:
-        _atomic_write_text(
+        atomic_write_text(
             vuln_dir / f"{report['id']}.md",
             render_vulnerability_md(report),
         )
@@ -77,16 +174,16 @@ def write_vulnerabilities(
     for report in sorted_reports:
         csv_writer.writerow(
             {
-                "id": report["id"],
-                "title": report["title"],
-                "severity": report["severity"].upper(),
-                "timestamp": report["timestamp"],
-                "file": f"vulnerabilities/{report['id']}.md",
+                "id": csv_safe(report["id"]),
+                "title": csv_safe(report["title"]),
+                "severity": csv_safe(report["severity"].upper()),
+                "timestamp": csv_safe(report["timestamp"]),
+                "file": csv_safe(f"vulnerabilities/{report['id']}.md"),
             },
         )
-    _atomic_write_text(csv_path, csv_buf.getvalue())
+    atomic_write_text(csv_path, csv_buf.getvalue())
 
-    _atomic_write_text(
+    atomic_write_text(
         run_dir / "vulnerabilities.json",
         json.dumps(vulnerability_reports, ensure_ascii=False, indent=2, default=str),
     )
@@ -101,11 +198,18 @@ def write_vulnerabilities(
     return len(new_reports)
 
 
-def _atomic_write_text(path: Path, payload: str) -> None:
+def atomic_write_text(path: Path, payload: str) -> None:
+    """Write *payload* to *path* via a sibling temp file and an atomic rename.
+
+    ``newline=""`` disables newline translation so *payload* lands byte-for-byte:
+    the CSV index carries its own ``\\r\\n`` terminators, which text mode would turn
+    into ``\\r\\r\\n`` on Windows.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
+        newline="",
         dir=str(path.parent),
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -124,8 +228,15 @@ def render_vulnerability_md(report: dict[str, Any]) -> str:  # noqa: PLR0912, PL
         f"**Found:** {report.get('timestamp', 'unknown')}",
     ]
 
+    dep_meta = report.get("dependency_metadata") or {}
     metadata: list[tuple[str, Any]] = [
         ("Target", report.get("target")),
+        ("Package", dep_meta.get("package_name")),
+        ("Ecosystem", dep_meta.get("package_ecosystem")),
+        ("Installed Version", dep_meta.get("installed_version")),
+        ("Fixed Version", dep_meta.get("fixed_version")),
+        ("Introduced By", dep_meta.get("introduced_by")),
+        ("Dependency Chain", dep_meta.get("dependency_path")),
         ("Endpoint", report.get("endpoint")),
         ("Method", report.get("method")),
         ("CVE", report.get("cve")),
@@ -134,6 +245,15 @@ def render_vulnerability_md(report: dict[str, Any]) -> str:  # noqa: PLR0912, PL
     cvss = report.get("cvss")
     if cvss is not None:
         metadata.append(("CVSS", cvss))
+    advisory_cvss = dep_meta.get("advisory_cvss")
+    if advisory_cvss is not None and advisory_cvss != cvss:
+        metadata.append(("Advisory CVSS", advisory_cvss))
+    if dep_meta.get("contextual_cvss_vector"):
+        metadata.append(("Contextual CVSS Vector", dep_meta["contextual_cvss_vector"]))
+    if report.get("confidence"):
+        metadata.append(("Confidence", str(report["confidence"]).title()))
+    if report.get("fix_effort"):
+        metadata.append(("Fix Effort", str(report["fix_effort"]).title()))
     for label, value in metadata:
         if value:
             lines.append(f"**{label}:** {value}")
@@ -143,14 +263,39 @@ def render_vulnerability_md(report: dict[str, Any]) -> str:  # noqa: PLR0912, PL
     lines.append(report.get("description") or "No description provided.")
     lines.append("")
 
+    if report.get("evidence"):
+        lines.append("## Evidence\n")
+        lines.append(str(report["evidence"]))
+        lines.append("")
+
     if report.get("impact"):
         lines.append("## Impact\n")
         lines.append(str(report["impact"]))
         lines.append("")
 
+    if report.get("counterevidence"):
+        lines.append("## Counterevidence\n")
+        lines.append(str(report["counterevidence"]))
+        lines.append("")
+
+    if report.get("confidence_rationale"):
+        lines.append("## Confidence Rationale\n")
+        lines.append(str(report["confidence_rationale"]))
+        lines.append("")
+
+    if report.get("severity_change_conditions"):
+        lines.append("## What Would Change This Severity\n")
+        lines.append(str(report["severity_change_conditions"]))
+        lines.append("")
+
     if report.get("technical_analysis"):
         lines.append("## Technical Analysis\n")
         lines.append(str(report["technical_analysis"]))
+        lines.append("")
+
+    if dep_meta.get("contextual_cvss_reasoning"):
+        lines.append("## Contextual CVSS\n")
+        lines.append(str(dep_meta["contextual_cvss_reasoning"]))
         lines.append("")
 
     if report.get("poc_description") or report.get("poc_script_code"):
@@ -159,9 +304,12 @@ def render_vulnerability_md(report: dict[str, Any]) -> str:  # noqa: PLR0912, PL
             lines.append(str(report["poc_description"]))
             lines.append("")
         if report.get("poc_script_code"):
-            lines.append("```")
-            lines.append(str(report["poc_script_code"]))
-            lines.append("```")
+            language, code = parse_fenced_code(str(report["poc_script_code"]))
+            fence_lang = language or guess_language_name(code)
+            fence = safe_fence(code)
+            lines.append(f"{fence}{fence_lang}")
+            lines.append(code)
+            lines.append(fence)
             lines.append("")
 
     if report.get("code_locations"):
@@ -178,7 +326,11 @@ def render_vulnerability_md(report: dict[str, Any]) -> str:  # noqa: PLR0912, PL
             if loc.get("label"):
                 lines.append(f"  {loc['label']}")
             if loc.get("snippet"):
-                lines.append(f"  ```\n  {loc['snippet']}\n  ```")
+                snippet = str(loc["snippet"])
+                fence = safe_fence(snippet)
+                lines.append(f"  {fence}")
+                lines.extend(f"  {ln}" for ln in snippet.splitlines())
+                lines.append(f"  {fence}")
             if loc.get("fix_before") or loc.get("fix_after"):
                 lines.append("\n  **Suggested Fix:**")
                 lines.append("```diff")
@@ -194,4 +346,51 @@ def render_vulnerability_md(report: dict[str, Any]) -> str:  # noqa: PLR0912, PL
         lines.append(str(report["remediation_steps"]))
         lines.append("")
 
+    if report.get("fix_verification"):
+        lines.append("## Fix Verification\n")
+        lines.append(str(report["fix_verification"]))
+        lines.append("")
+
+    if report.get("assumptions"):
+        lines.append("## Assumptions\n")
+        lines.append(str(report["assumptions"]))
+        lines.append("")
+
+    lines.extend(render_update_history(report.get("update_history")))
+
     return "\n".join(lines)
+
+
+def render_update_history(history: Any) -> list[str]:
+    """Render the audit trail of every revision a report has received."""
+    if not isinstance(history, list):
+        return []
+    entries: list[dict[str, Any]] = [
+        cast("dict[str, Any]", e) for e in history if isinstance(e, dict)
+    ]
+    if not entries:
+        return []
+
+    lines = ["## Update History\n"]
+    for entry in entries:
+        author = str(entry.get("agent_name") or entry.get("agent_id") or "an agent")
+        raw_fields = entry.get("fields")
+        fields: list[Any] = raw_fields if isinstance(raw_fields, list) else []
+        changed = ", ".join(str(field) for field in fields)
+        timestamp = str(entry.get("timestamp") or "unknown")
+        lines.append(f"**{timestamp}** — {author} updated: {changed}")
+        raw_dropped = entry.get("dropped_fields")
+        if isinstance(raw_dropped, list) and raw_dropped:
+            dropped = ", ".join(str(field) for field in raw_dropped)
+            lines.append(f"  Dropped as superseded: {dropped}")
+        for key, label in (
+            ("previous_severity", "severity"),
+            ("previous_cvss", "CVSS"),
+            ("previous_confidence", "confidence"),
+        ):
+            if entry.get(key) is not None:
+                lines.append(f"  Previous {label}: {entry[key]}")
+        if entry.get("reason"):
+            lines.append(f"  Reason: {entry['reason']}")
+        lines.append("")
+    return lines

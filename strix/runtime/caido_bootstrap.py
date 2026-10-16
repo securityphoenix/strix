@@ -10,16 +10,15 @@ exposed-port URL for all subsequent SDK calls.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from typing import TYPE_CHECKING
 
-from caido_sdk_client import Client, TokenAuthOptions
-from caido_sdk_client.types import CreateProjectOptions
-
 
 if TYPE_CHECKING:
     from agents.sandbox.session import BaseSandboxSession
+    from caido_sdk_client import Client
 
 
 logger = logging.getLogger(__name__)
@@ -86,16 +85,31 @@ async def bootstrap_caido(
     container_url: str,
 ) -> Client:
     """Connect to the in-container Caido sidecar and select a fresh project."""
+    # The Caido SDK (and its generated GraphQL schema) is slow to import and is
+    # only needed once a sandbox is actually being bootstrapped, so it is
+    # imported here rather than at module scope.
+    from caido_sdk_client import Client, TokenAuthOptions
+    from caido_sdk_client.types import CreateProjectOptions
+
     logger.info("Bootstrapping Caido client (host=%s, container=%s)", host_url, container_url)
 
     access_token = await _login_as_guest(session, container_url=container_url)
 
     client = Client(host_url, auth=TokenAuthOptions(token=access_token))
-    await client.connect()
-
-    project = await client.project.create(
-        CreateProjectOptions(name="sandbox", temporary=True),
-    )
-    await client.project.select(project.id)
+    try:
+        # connect() is inside the guard as well: a cancellation there (scan
+        # teardown while the bootstrap is still in flight) would otherwise
+        # leave the half-connected transport behind.
+        await client.connect()
+        project = await client.project.create(
+            CreateProjectOptions(name="sandbox", temporary=True),
+        )
+        await client.project.select(project.id)
+    except BaseException:
+        # The client never reaches the session bundle if connect or project
+        # setup fails, so close it here to avoid leaking the transport.
+        with contextlib.suppress(Exception):
+            await client.aclose()
+        raise
     logger.info("Caido project selected: %s", project.id)
     return client

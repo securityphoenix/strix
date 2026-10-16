@@ -1,4 +1,6 @@
-.PHONY: help install dev-install format lint type-check security check-all clean pre-commit setup-dev dev
+.PHONY: help install dev-install format lint format-check lint-check type-check security check-all clean pre-commit setup-dev dev viewer wheel tui-build tui-test tui-lint
+
+TUI_BINARY := build/sidecar/strix-tui$(if $(filter Windows_NT,$(OS)),.exe)
 
 help:
 	@echo "Available commands:"
@@ -8,14 +10,21 @@ help:
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  format        - Format code with ruff"
-	@echo "  lint          - Lint code with ruff"
+	@echo "  lint          - Lint code with ruff and apply fixes"
+	@echo "  format-check  - Check formatting without modifying files"
+	@echo "  lint-check    - Check lint without modifying files"
 	@echo "  type-check    - Run type checking with mypy and pyright"
 	@echo "  security      - Run security checks with bandit"
 	@echo "  check-all     - Run all code quality checks"
 	@echo ""
 	@echo "Development:"
 	@echo "  pre-commit    - Run pre-commit hooks on all files"
+	@echo "  viewer        - Rebuild the local-viewer SPA (commit the output)"
+	@echo "  wheel         - Build a platform wheel with the bundled Go sidecar"
 	@echo "  clean         - Clean up cache files and artifacts"
+	@echo "  tui-build     - Build the Bubble Tea TUI"
+	@echo "  tui-test      - Test the Bubble Tea TUI"
+	@echo "  tui-lint      - Vet and format-check the Bubble Tea TUI"
 
 install:
 	uv sync --no-dev
@@ -38,6 +47,12 @@ lint:
 	uv run ruff check . --fix
 	@echo "✅ Linting complete!"
 
+format-check:
+	uv run ruff format --check .
+
+lint-check:
+	uv run ruff check .
+
 type-check:
 	@echo "🔍 Type checking with mypy..."
 	uv run mypy strix/
@@ -50,7 +65,7 @@ security:
 	uv run bandit -r strix/ -c pyproject.toml
 	@echo "✅ Security checks complete!"
 
-check-all: format lint type-check security
+check-all: format-check lint-check type-check security
 	@echo "✅ All code quality checks passed!"
 
 pre-commit:
@@ -66,5 +81,23 @@ clean:
 	find . -name "*.pyc" -delete 2>/dev/null || true
 	@echo "✅ Cleanup complete!"
 
+viewer:
+	@echo "🖥️  Building the local-viewer SPA..."
+	cd strix/interface/viewer/frontend && npm ci && npm run build
+	@echo "✅ Viewer built to strix/interface/viewer/static/ (commit the changes)."
+
+wheel:
+	uv build --wheel
+
 dev: format lint type-check
 	@echo "✅ Development cycle complete!"
+
+tui-build:
+	mkdir -p build/sidecar
+	cd strix/interface/tui && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../../../$(TUI_BINARY) ./cmd/strix-tui
+
+tui-test:
+	cd strix/interface/tui && go test -race ./...
+
+tui-lint:
+	cd strix/interface/tui && test -z "$$(gofmt -l .)" && go vet ./...
